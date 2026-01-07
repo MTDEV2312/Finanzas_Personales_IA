@@ -93,7 +93,19 @@ const server = Bun.serve({
 
                 const { service, stream } = await getStreamWithFallback(messages);
 
-                const readableStream = (ReadableStream as any).from(stream);
+                
+                const readableStream = new ReadableStream({
+                    async start(controller) {
+                        try {
+                            for await (const chunk of stream) {
+                                controller.enqueue(chunk);
+                            }
+                            controller.close();
+                        } catch (error) {
+                            controller.error(error);
+                        }
+                    }
+                });
 
                 return new Response(readableStream,{
                     headers:{
