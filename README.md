@@ -42,12 +42,17 @@ bun run dev
 2. Importar el archivo `/n8n/finanzas_workflow.json`.
 3. Configurar las credenciales de Google Sheets.
 
+> Importante: El archivo JSON exportado de n8n no incluye credenciales ni variables sensibles. Tras importar el flujo, configura en n8n las credenciales y variables necesarias (según tu caso):
+- Credenciales de Google (Service Account u OAuth) y/o `Spreadsheet ID`.
+- URL/Secret del Webhook (si usas autenticación en el webhook).
+- Cualquier otro valor sensible (tokens, IDs, URLs) referenciado por nodos del flujo.
+
 ### 3. Alexa
 1. Crear una nueva Skill en Amazon Developer Console.
 2. Ir a "JSON Editor" y pegar el contenido de `/alexaSkill/interaction_model.json`.
 3. Apuntar el Endpoint al Webhook de n8n.
 
-## 🛠️ Tecnologías Usadas
+## Tecnologías Usadas
 * Amazon Alexa Skills Kit
 * n8n (Workflow Automation)
 * Bun (runtime y gestor de paquetes)
