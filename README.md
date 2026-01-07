@@ -1,60 +1,98 @@
-# Asistente de Finanzas por Voz con Alexa, n8n y AI
+# 💰 Voice Finance Assistant (Alexa + n8n + AI)
 
-Este proyecto es un sistema completo de registro de gastos controlado por voz. Permite al usuario dictar sus gastos a un dispositivo Alexa, procesar el lenguaje natural con IA para estructurar los datos y guardarlos automáticamente en Google Sheets.
+![Alexa](https://img.shields.io/badge/alexa-skill-blue?style=flat-square&logo=amazon-alexa)
+![n8n](https://img.shields.io/badge/n8n-workflow-ff6bb5?style=flat-square&logo=n8n)
+![Bun](https://img.shields.io/badge/Bun-1.0-black?style=flat-square&logo=bun)
+![Google Sheets](https://img.shields.io/badge/Google%20Sheets-Database-34A853?style=flat-square&logo=google-sheets)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?style=flat-square&logo=typescript)
 
-## Arquitectura del Sistema
+Un sistema **Full-Stack de Voz** para el registro de gastos financieros. Este proyecto integra una Skill de Alexa personalizada con un backend de automatización (n8n) y procesamiento de lenguaje natural (AI) para estructurar gastos no estructurados y persistirlos en tiempo real.
 
-**Voz (Alexa) ➡️ Webhook (n8n) ➡️ IA (API Procesamiento) ➡️ Base de Datos (Google Sheets)**
+---
 
-1. **Alexa Skill:** Captura el input del usuario ("Compré una hamburguesa de 12 dólares").
-2. **n8n Workflow:** Orquesta la comunicación. Recibe el texto, lo envía a la API de IA y maneja la respuesta.
-3. **API Personalizada:** Limpia y estructura el texto desordenado en un formato JSON estandarizado (`monto`, `categoria`, `concepto`).
-4. **Google Sheets:** Actúa como base de datos persistente.
+## 🏗️ Arquitectura del Sistema
 
-## Estructura del Repositorio
+El sistema utiliza una arquitectura orientada a eventos donde Alexa actúa como el frontend de voz y n8n como el orquestador de backend.
 
-* `/api`: Código fuente de la API de procesamiento de texto (Node).
-* `/n8n`: Archivo JSON importable con el flujo de trabajo completo de automatización.
-* `/alexaSkill`: Modelo de interacción (Intents, Slots) listo para importar en Alexa Developer Console.
-
-## Instalación y Uso
-
-### Prerrequisitos
-- Bun: este proyecto usa Bun para ejecutar la API.
-- Windows: instala Bun con PowerShell:
-
-```powershell
-iwr bun.sh/install.ps1 -UseBasicParsing | iex
-# Verifica la instalación
-bun --version
+```mermaid
+graph LR
+    A[Usuario] -- Voz --> B(Alexa Echo Dot)
+    B -- JSON Payload --> C{n8n Webhook}
+    
+    subgraph Backend Logic
+    C -- LaunchRequest --> D[Gestor de Sesión]
+    C -- IntentRequest --> E[API Procesamiento AI]
+    D -- "Hola, ¿qué gastaste?" --> B
+    E -- Texto Crudo --> F((LLM / Parser))
+    F -- JSON Estructurado --> G[Google Sheets]
+    end
+    
+    G -- Confirmación --> H[Respuesta TTS]
+    H --> B
 ```
 
-### 1. Backend (API)
-Instalar dependencias y ejecutar:
-```bash
+### Flujo de Datos
+
+1. **Input:** El usuario dicta una frase natural: *"Alexa, abre mi contador... compré una hamburguesa de 12 dólares"*.
+2. **Transmisión:** Alexa convierte el audio a texto (STT) y envía un payload JSON vía HTTPS  al Webhook de n8n.
+3. **Enrutamiento Inteligente:** n8n discrimina entre `LaunchRequest` (abrir la app) y `RegistrarGastoIntent` (procesar datos).
+4. **Procesamiento (ETL):** La API personalizada (corriendo en Bun) recibe el texto desordenado, extrae entidades (`monto`, `moneda`, `categoría`) y normaliza los datos.
+5. **Persistencia:** Los datos limpios se inyectan en Google Sheets como base de datos.
+6. **Feedback:** Se genera una respuesta de texto (TTS) dinámica confirmando la transacción al usuario.
+
+---
+
+## 📂 Estructura del Repositorio
+
+| Carpeta         | Descripción                                                                                                |
+|-----------------|------------------------------------------------------------------------------------------------------------|
+| `/api`          | **Microservicio de IA.** API construida con **Bun** y TypeScript encargada de limpiar y estructurar el texto natural del usuario. |
+| `/n8n`          | **Lógica de Negocio.** Workflow JSON de n8n que maneja los webhooks, condicionales (If/Switch) y conexiones API.     |
+| `/alexaSkill`   | **Frontend de Voz.** Modelo de interacción (Interaction Model) con los Intents, Slots (AMAZON.SearchQuery) y Utterances. |
+
+---
+
+## 🚀 Instalación y Despliegue
+
+### Prerrequisitos
+
+* **Bun:** Runtime de alto rendimiento para JavaScript/TypeScript.
+* **n8n:** Servidor de automatización (Local o Cloud).
+
+
+### 1. Configuración de la API (Backend)
+
+Este proyecto utiliza **Bun** por su velocidad en tiempo de ejecución.
+
+```powershell
+# Ejecutar Microservicio
 cd api
 bun install
 bun run dev
 ```
 
-### 2. n8n
-1. Instalar n8n.
-2. Importar el archivo `/n8n/finanzas_workflow.json`.
-3. Configurar las credenciales de Google Sheets.
+La API estará disponible en `http://localhost:3000` (o el puerto configurado).
 
-> Importante: El archivo JSON exportado de n8n no incluye credenciales ni variables sensibles. Tras importar el flujo, configura en n8n las credenciales y variables necesarias (según tu caso):
-- Credenciales de Google (Service Account u OAuth) y/o `Spreadsheet ID`.
-- URL/Secret del Webhook (si usas autenticación en el webhook).
-- Cualquier otro valor sensible (tokens, IDs, URLs) referenciado por nodos del flujo.
+### 2. Importación del Workflow (n8n)
 
-### 3. Alexa
-1. Crear una nueva Skill en Amazon Developer Console.
-2. Ir a "JSON Editor" y pegar el contenido de `/alexaSkill/interaction_model.json`.
-3. Apuntar el Endpoint al Webhook de n8n.
+1. Instalar e iniciar n8n.
+2. Importar el archivo [finanzas_workflow.json](n8n/finanzas_workflow.json).
+3. **Configuración de Seguridad:**
 
-## Tecnologías Usadas
-* Amazon Alexa Skills Kit
-* n8n (Workflow Automation)
-* Bun (runtime y gestor de paquetes)
-* Node.js
-* Google Sheets API
+> ⚠️ **Importante:** El workflow exportado no contiene credenciales.
+
+Tras importar, configura:
+* **Google Sheets:** Credenciales OAuth2 o Service Account + Spreadsheet ID.
+* **HTTP Request Nodes:** Actualiza las URLs para apuntar a tu instancia local de la API (`http://localhost:3000`).
+* **Webhook:** Configura autenticación si es necesario.
+
+### 3. Configuración de Alexa
+
+1. Crear nueva Skill en [Alexa Developer Console](https://developer.amazon.com/alexa/console/ask).
+2. Seleccionar "Custom Model" y "Provision your own".
+3. En **JSON Editor**, pegar el contenido de [interaction_model.json](alexaSkill/interaction_model.json).
+4. **Endpoint:** Configurar el endpoint HTTPS apuntado al webhook de n8n.
+5. **SSL:** Seleccionar "My development endpoint is a sub-domain of a domain that has a wildcard certificate".
+6. **Build Model:** Compilar el modelo y probar en la consola de prueba.
+
+---
