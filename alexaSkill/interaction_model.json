@@ -1,0 +1,52 @@
+{
+    "interactionModel": {
+        "languageModel": {
+            "invocationName": "mi contador",
+            "intents": [
+                {
+                    "name": "AMAZON.CancelIntent",
+                    "samples": []
+                },
+                {
+                    "name": "AMAZON.HelpIntent",
+                    "samples": []
+                },
+                {
+                    "name": "AMAZON.StopIntent",
+                    "samples": []
+                },
+                {
+                    "name": "AMAZON.NavigateHomeIntent",
+                    "samples": []
+                },
+                {
+                    "name": "RegistrarGastoIntent",
+                    "slots": [
+                        {
+                            "name": "Gasto",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "anotar {Gasto}",
+                        "nuevo gasto de {Gasto}",
+                        "oye gasté {Gasto}",
+                        "el precio fue {Gasto}",
+                        "costó {Gasto}",
+                        "me costó {Gasto}",
+                        "ingresa {Gasto}",
+                        "agrega {Gasto}",
+                        "me compré {Gasto}",
+                        "pagué {Gasto}",
+                        "compré {Gasto}",
+                        "gasté {Gasto}",
+                        "dile a mi contador que {Gasto}",
+                        "registra {Gasto}",
+                        "anota {Gasto}"
+                    ]
+                }
+            ],
+            "types": []
+        }
+    }
+}
