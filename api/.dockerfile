@@ -5,7 +5,7 @@ WORKDIR /api
 COPY api/bun.lock api/package.json ./
 RUN bun install --production
 
-COPY . .
+COPY api/ .
 
 EXPOSE 3002
 CMD ["bun", "run", "start"]
