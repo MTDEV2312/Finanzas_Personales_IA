@@ -1,6 +1,6 @@
 FROM oven/bun:1
 
-WORKDIR /app
+WORKDIR /app/api
 
 COPY api/bun.lock api/package.json ./
 RUN bun install --production
