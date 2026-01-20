@@ -85,6 +85,21 @@ const server = Bun.serve({
     idleTimeout: Number(process.env.IDLE_TIMEOUT_SECONDS ?? 120),
     async fetch(req) {
         const {pathname} = new URL(req.url);
+
+        if (req.method === 'GET' && pathname === '/health') {
+            const uptimeSeconds = typeof process !== 'undefined' && typeof process.uptime === 'function'
+                ? process.uptime()
+                : 0;
+
+            return new Response(JSON.stringify({
+                status: 'ok',
+                uptime: uptimeSeconds,
+                timestamp: new Date().toISOString(),
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        }
         if (req.method === 'POST' && pathname === '/chat') {
             try {
                 const {messages} = await req.json() as {messages: ChatMessage[]};
