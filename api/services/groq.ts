@@ -1,11 +1,12 @@
 import { Groq } from 'groq-sdk';
 import type { AIService, ChatMessage } from '../types';
 
-const groq = new Groq();
+let groq: Groq | undefined;
 
 export const groqService: AIService = {
   name: 'groq',
   async chat(messages: ChatMessage[]) {
+    groq ??= new Groq();
     const chatCompletion = await groq.chat.completions.create({
       messages,
       model: "openai/gpt-oss-120b",
