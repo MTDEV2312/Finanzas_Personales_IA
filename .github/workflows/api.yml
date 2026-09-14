@@ -2,11 +2,17 @@
 # GitHub Actions Workflow — API CI/CD
 # =============================================================================
 # Trigger: Push/PR to main with api/** or workflow changes
-# Runner: Self-hosted (Proxmox LXC Runner)
+# Runner: Hybrid (ubuntu-latest for CI, Self-hosted Proxmox LXC for CD)
 # Target: Proxmox LXC API Server
 # =============================================================================
 
 name: API CI/CD
+
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+permissions:
+  contents: read
 
 # =============================================================================
 # TRIGGERS
@@ -40,7 +46,7 @@ jobs:
   # ===========================================================================
   ci:
     name: CI — Validation
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -92,12 +98,19 @@ jobs:
           SSH_HOST: ${{ secrets.API_SSH_HOST || secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.API_SSH_USER || secrets.SSH_USER }}
           SSH_PORT: ${{ secrets.API_SSH_PORT || secrets.SSH_PORT || '22' }}
+          SSH_KNOWN_HOSTS: ${{ secrets.API_SSH_KNOWN_HOSTS || secrets.SSH_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "✅ Ingested API_SSH_KNOWN_HOSTS secret"
+          else
+            echo "::warning::API_SSH_KNOWN_HOSTS secret not configured; falling back to dynamic ssh-keyscan"
+            ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
           chmod 644 ~/.ssh/known_hosts
 
           cat > ~/.ssh/config << EOF
