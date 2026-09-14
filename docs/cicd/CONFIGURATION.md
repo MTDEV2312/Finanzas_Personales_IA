@@ -9,7 +9,22 @@ This document contains all configuration files and settings required for the CI/
 | `API_SSH_HOST` | IP address of API LXC | `your_server_ip_here` | Yes |
 | `API_SSH_USER` | SSH username | `root` | Yes |
 | `API_SSH_KEY` | SSH private key (ed25519) | `-----BEGIN OPENSSH...` | Yes |
+| `API_SSH_PORT` | SSH port (defaults to 22 if omitted) | `22` | Optional |
+| `API_SSH_KNOWN_HOSTS` | Pre-shared SSH host key fingerprint to prevent MITM | `your_server_ip_here ssh-ed25519 AAAAC3...` | Optional |
 | `API_DEPLOY_PATH` | Base deploy path on API server (defaults to `/opt/finanzas-api`) | `/opt/finanzas-api` | Optional |
+
+### Generating `API_SSH_KNOWN_HOSTS`
+
+To obtain the host key fingerprint of the API server to store as `API_SSH_KNOWN_HOSTS`:
+
+```bash
+# Query the API server's host key from an internal network machine or runner LXC:
+ssh-keyscan -p 22 -H your_server_ip_here
+```
+
+Copy the entire output line (e.g. `your_server_ip_here ssh-ed25519 AAAAC3...`) and save it as the `API_SSH_KNOWN_HOSTS` secret in GitHub.
+
+> **Note**: If `API_SSH_KNOWN_HOSTS` is not configured, the workflow falls back to running `ssh-keyscan` dynamically during deployment and emits a warning annotation (`::warning::API_SSH_KNOWN_HOSTS secret not configured; falling back to dynamic ssh-keyscan`). Configuring this secret prevents potential Man-in-the-Middle (MITM) attacks.
 
 ### How to Add Secrets
 
@@ -236,15 +251,26 @@ ls -lt /opt/finanzas-api/releases/
 
 ## Workflow Configuration
 
+### Top-Level Permissions
+
+```yaml
+permissions:
+  contents: read
+```
+
+Constrains the automated `GITHUB_TOKEN` to read repository contents only, preventing any write actions, package publications, or repository alterations.
+
 ### Path Filters
 
 ```yaml
 on:
   push:
+    branches: [main]
     paths:
       - 'api/**'                    # Any change in api/
       - '.github/workflows/api.yml' # Workflow itself
   pull_request:
+    branches: [main]
     paths:
       - 'api/**'
       - '.github/workflows/api.yml'
@@ -258,15 +284,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 ```
 
-### Job Dependencies
+### Runner Placement & Job Dependencies
 
 ```yaml
 jobs:
   ci:
-    # Runs first
+    name: CI — Validation
+    runs-on: ubuntu-latest  # Ephemeral cloud runner (sandboxes PRs from internal LAN)
+
   deploy:
-    needs: ci  # Only runs if ci succeeds
+    name: Deploy to Production
+    needs: ci               # Only runs if CI passes
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted    # Proxmox LXC runner (internal LAN deployment)
 ```
 
 ## Health Check Configuration

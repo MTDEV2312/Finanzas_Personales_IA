@@ -2,106 +2,104 @@
 
 ## System Overview
 
-The CI/CD system connects two isolated LXC containers via SSH, using GitHub Actions as the orchestration layer.
+The CI/CD pipeline implements a hybrid security architecture operating across two trust domains:
+1. **GitHub Cloud Infrastructure**: Ephemeral `ubuntu-latest` cloud runners execute continuous integration (CI) validation for all pull requests and pushes, completely sandboxing untrusted code from internal networks.
+2. **On-Premises Proxmox VE Private Network**: Two isolated LXC containers connected via internal SSH handle continuous deployment (CD). A self-hosted runner executes deployments strictly on verified pushes to `main`.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              GitHub                                     │
-│  ┌──────────────────┐                                                   │
-│  │  Repository       │                                                   │
-│  │  Finanzas_Personal│─── Push/PR (api/**) ───┐                        │
-│  └──────────────────┘                          │                        │
-└─────────────────────────────────────────────────┼────────────────────────┘
-                                                  │
-                                                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    LXC: Runner (Proxmox)                                │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  Self-Hosted Runner (github-runner user)                         │  │
-│  │                                                                   │  │
-│  │  Steps:                                                           │  │
-│  │  1. Checkout repository                                          │  │
-│  │  2. Setup Bun runtime                                            │  │
-│  │  3. Install dependencies (bun install)                           │  │
-│  │  4. Type checking (bunx tsc --noEmit)                            │  │
-│  │  5. SSH connection to LXC API                                    │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                              │                                          │
-│                              │ SSH (ed25519)                            │
-└──────────────────────────────┼──────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    LXC: API Server (Proxmox)                            │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  bun-api.service (systemd, root)                                  │  │
-│  │                                                                   │  │
-│  │  Working Directory: /opt/finanzas-api/current                     │  │
-│  │  Port: 3000                                                       │  │
-│  │  Runtime: Bun v1.3.5                                              │  │
-│  │                                                                   │  │
-│  │  Endpoints:                                                       │  │
-│  │  - GET /health → { status: 'ok' }                                │  │
-│  │  - POST /chat  → AI processing                                   │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                              │                                          │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  Pointer:  /opt/finanzas-api/current -> releases/<timestamp>      │  │
-│  │  Releases: /opt/finanzas-api/releases/<timestamp>/ (max 5 kept)  │  │
-│  │  Shared:   /opt/finanzas-api/shared/.env (persistent config)      │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            GitHub Cloud Infrastructure                           │
+│  ┌──────────────────┐                                                            │
+│  │  Repository       │─── PR / Push (api/**) ───┐                                 │
+│  │  Finanzas_Personal│                          │                                 │
+│  │  permissions:     │                          ▼                                 │
+│  │    contents: read │        ┌───────────────────────────────────────────────┐   │
+│  └──────────────────┘        │ Ephemeral Cloud Runner (ubuntu-latest)        │   │
+│                              │  Steps:                                       │   │
+│                              │  1. Checkout code (actions/checkout@v4)       │   │
+│                              │  2. Setup Bun runtime (setup-bun@v2)          │   │
+│                              │  3. Install dependencies (frozen-lockfile)    │   │
+│                              │  4. Type checking (bun run typecheck)         │   │
+│                              │  5. Unit tests (bun test)                     │   │
+│                              │  * NO internal LAN access / NO deploy secrets │   │
+│                              └───────────────────────┬───────────────────────┘   │
+└──────────────────────────────────────────────────────┼───────────────────────────┘
+                                                       │ CI Passed & Push to main
+                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           Proxmox VE (Internal Private LAN)                      │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │ LXC: Runner (self-hosted)                                                  │  │
+│  │                                                                            │  │
+│  │  Steps:                                                                    │  │
+│  │  1. Checkout code (actions/checkout@v4)                                    │  │
+│  │  2. Install production dependencies (bun install --production)            │  │
+│  │  3. Configure SSH (~/.ssh/known_hosts via API_SSH_KNOWN_HOSTS secret)      │  │
+│  │  4. Create timestamped release directory (/opt/finanzas-api/releases/...)   │  │
+│  │  5. Rsync artifacts & link shared configuration (/opt/finanzas-api/shared) │  │
+│  │  6. Atomic cutover (ln -sfn) & service reload (systemctl)                  │  │
+│  │  7. Retry healthcheck (GET /health) & auto-rollback on failure             │  │
+│  └─────────────────────────────────────┬──────────────────────────────────────┘  │
+│                                        │                                         │
+│                                        │ SSH (ed25519) + Host Verification       │
+│                                        ▼                                         │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │ LXC: API Server (bun-api.service)                                          │  │
+│  │                                                                            │  │
+│  │  Working Directory: /opt/finanzas-api/current -> releases/<timestamp>      │  │
+│  │  Shared Config:     /opt/finanzas-api/shared/.env                          │  │
+│  │  Service Target:    bun-api.service (Port 3000, internal only)             │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Component Responsibilities
 
-### GitHub Actions
+### GitHub Actions (Orchestrator)
 
-- **Trigger detection**: Path-based filtering (`api/**`)
-- **CI validation**: Type checking, future tests
-- **Orchestration**: Coordinate deploy steps
-- **Secrets management**: Store SSH credentials
+- **Trigger detection**: Path-based filtering (`api/**`, `.github/workflows/api.yml`)
+- **Least-privilege token**: Top-level `permissions: contents: read`
+- **Job dependency gating**: `deploy` strictly depends on `ci` passing and `push` to `refs/heads/main`
+- **Secrets management**: Store SSH credentials and host keys securely
 
-### Self-Hosted Runner
+### GitHub Cloud Runner (`ubuntu-latest`)
 
-- **Code execution**: Run CI steps locally
-- **SSH client**: Connect to API server
-- **Deploy agent**: Transfer files, restart services
-- **Health monitor**: Verify deployment success
+- **Untrusted code isolation**: Executes CI validation for PRs and push commits in an ephemeral cloud VM
+- **Static verification**: Type checking (`bun run typecheck`)
+- **Test execution**: Unit tests (`bun test`)
+- **Network sandbox**: Completely isolated from internal homelab/Proxmox network; zero access to deploy secrets
 
-### LXC API Server
+### Self-Hosted Runner (Proxmox LXC)
 
-- **Service hosting**: Run the Bun API via `/opt/finanzas-api/current`
-- **Release management**: Maintain immutable releases under `/opt/finanzas-api/releases/`
-- **Persistent config**: Maintain shared secrets at `/opt/finanzas-api/shared/.env`
+- **Deploy agent**: Executes deployment exclusively on verified pushes to `main`
+- **SSH client with host verification**: Ingests `API_SSH_KNOWN_HOSTS` or queries fingerprint via fallback
+- **Release management**: Rsyncs artifacts, asserts shared environment, and performs atomic pointer cutover
+- **Health monitoring & rollback**: Validates `GET /health` with retries; rolls back symlink instantly on failure
+
+### LXC API Server (Proxmox LXC)
+
+- **Service hosting**: Runs the Bun API via `/opt/finanzas-api/current`
+- **Release management**: Maintains immutable releases under `/opt/finanzas-api/releases/` (5 kept)
+- **Persistent config**: Maintains shared secrets at `/opt/finanzas-api/shared/.env` (chmod 0600)
 - **Pointer cutover**: Atomic symlink switching via `ln -sfn`
-- **Network exposure**: Serve API on port 3000
+- **Network exposure**: Serves API on port 3000 (restricted to internal traffic)
 
 ## Data Flow
 
-### Push to Main (Deploy)
+### Push to Main (Deploy Flow)
 
 ```
-Developer → git push → GitHub → Actions → Runner → SSH → LXC API
-                                                            │
-                                              ┌─────────────┼─────────────┐
-                                              │             │             │
-                                              ▼             ▼             ▼
-                                            Rsync        Symlink       Cutover
-                                         (releases/)  (shared/.env)   (current)
-                                                            │
-                                                            ▼
-                                                    Reload / Restart
-                                                            │
-                                                            ▼
-                                                       Health Check
-                                                            │
-                                                  ┌──────────┴──────────┐
-                                                  │                     │
-                                                  ▼                     ▼
-                                               Success               Rollback
-                                            (Prune >5)         (Pointer Revert
-                                                               & Purge Failed)
+Developer → git push → GitHub Actions (permissions: contents: read)
+                          │
+       ┌──────────────────┴──────────────────┐
+       ▼                                     ▼
+[CI: Cloud Runner (ubuntu-latest)]      [CD: Self-Hosted Runner (LXC)]
+• Checkout (v4) & Setup Bun (v2)        (Gated on CI pass & push to main)
+• bun install --frozen-lockfile         • SSH Key & Known Hosts verification
+• bun run typecheck                     • Rsync to /opt/finanzas-api/releases/
+• bun test                              • Symlink shared/.env & atomic cutover
+• Ephemeral, NO LAN / NO secrets        • Systemctl reload-or-restart
+                                        • Health check (GET /health) & rollback
 ```
 
 ### Deployment Sequence Diagram
@@ -110,15 +108,20 @@ Developer → git push → GitHub → Actions → Runner → SSH → LXC API
 sequenceDiagram
     autonumber
     participant Dev as Developer
-    participant GH as GitHub Actions (CI)
-    participant Runner as Self-Hosted Runner
+    participant GH as GitHub Actions (Orchestrator)
+    participant Cloud as Ephemeral Cloud Runner (ubuntu-latest)
+    participant Runner as Self-Hosted Runner (Proxmox LXC)
     participant API as Proxmox LXC (API Server)
     participant Systemd as bun-api.service
 
     Dev->>GH: Push to main (api/**)
-    GH->>Runner: Execute CI (typecheck & test)
-    Runner-->>GH: CI Passed
-    GH->>Runner: Start Deploy Job
+    GH->>Cloud: Dispatch CI Validation
+    Cloud->>Cloud: Checkout & Setup Bun
+    Cloud->>Cloud: bun run typecheck
+    Cloud->>Cloud: bun test
+    Cloud-->>GH: CI Validation Passed
+    GH->>Runner: Dispatch Deploy Job (push to main ONLY)
+    Runner->>Runner: Ingest API_SSH_KEY & verify API_SSH_KNOWN_HOSTS
     Runner->>API: SSH: mkdir /opt/finanzas-api/releases/<timestamp>
     Runner->>API: Rsync build artifacts to releases/<timestamp>/
     Runner->>API: Assert /opt/finanzas-api/shared/.env exists
@@ -140,19 +143,21 @@ sequenceDiagram
 ### Pull Request (CI Only)
 
 ```
-Developer → git push → GitHub → Actions → Runner
-                                              │
-                                              ▼
-                                    Type Checking + Tests
-                                              │
-                                      ┌───────┴───────┐
-                                      │               │
-                                      ▼               ▼
-                                   Pass            Fail
-                                      │               │
-                                      ▼               ▼
-                                   Allow          Block
-                                   Merge           Merge
+Developer → git push / PR → GitHub Actions → Cloud Runner (ubuntu-latest)
+                                                │
+                                                ▼
+                                      Type Checking + Tests
+                                                │
+                                        ┌───────┴───────┐
+                                        │               │
+                                        ▼               ▼
+                                     Pass            Fail
+                                        │               │
+                                        ▼               ▼
+                                     Allow          Block
+                                     Merge           Merge
+
+* PRs never execute on the self-hosted runner and have zero access to the private network or secrets.
 ```
 
 ## Network Requirements
@@ -239,18 +244,27 @@ bun-api.service
 ## Security Boundaries
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Trust Boundaries                          │
-│                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   GitHub      │    │   Runner     │    │   API LXC    │  │
-│  │              │    │              │    │              │  │
-│  │  - Secrets   │───▶│  - SSH Key   │───▶│  - Service   │  │
-│  │  - Workflows │    │  - Workspace │    │  - Files     │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                              │
-│  Isolation: Separate LXCs                                    │
-│  Authentication: SSH ed25519                                 │
-│  Authorization: sudoers (limited commands)                  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             Trust & Isolation Boundaries                         │
+│                                                                                  │
+│   TIER 1: GITHUB CLOUD                          TIER 2: ON-PREM PRIVATE LAN      │
+│  ┌───────────────────────┐                     ┌──────────────┐ ┌─────────────┐ │
+│  │ Actions Orchestrator  │                     │ Runner LXC   │ │ API LXC     │ │
+│  │ - secrets masking     │                     │ (self-hosted)│ │             │ │
+│  │ - permissions: read   │                     │              │ │ bun-api     │ │
+│  └───────────┬───────────┘                     │ - CD deploy  │ │ .env shared │ │
+│              │                                 │   only       │ │ port 3000   │ │
+│              ├───────────────────┐             │ - SSH key    │ │ internal    │ │
+│              ▼                   ▼             │ - known_hosts│ │             │ │
+│  ┌───────────────────────┐ ┌─────────────────┐ └──────┬───────┘ └──────▲──────┘ │
+│  │ Ephemeral Runner      │ │ Push to main    │        │   SSH (22)     │        │
+│  │ (ubuntu-latest)       │ │ Deploy Dispatch │        └────────────────┘        │
+│  │ - Typecheck & Tests   │ └────────┬────────┘                                  │
+│  │ - Sandboxed PR runs   │          │                                           │
+│  │ - NO LAN reachability │          ▼                                           │
+│  └───────────────────────┘   (Enters internal LAN on verified push only)        │
+│                                                                                  │
+│  Public PRs execute exclusively in Tier 1 Ephemeral Runners.                     │
+│  Tier 2 On-Prem Runner is never reachable or invocable by untrusted fork PRs.    │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```

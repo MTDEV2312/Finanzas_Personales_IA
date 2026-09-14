@@ -19,30 +19,45 @@ This document covers security aspects of the CI/CD implementation.
 | Vector | Risk | Mitigation |
 |--------|------|------------|
 | Compromised SSH key | High | Key rotation, limited permissions |
-| Malicious PR | High | No deploy from PRs |
-| Leaked secrets | Critical | GitHub secret masking |
-| Unauthorized access | High | SSH only, firewall rules |
-| Supply chain attack | Medium | Pinned dependencies, lockfile |
-| Runner compromise | High | Separate LXC, minimal permissions |
+| Malicious PR / Fork execution | Critical | CI on ephemeral cloud runner (`ubuntu-latest`), no deploy from PRs, no LAN/secret access |
+| SSH Man-in-the-Middle (MITM) | High | Host key pinning via `API_SSH_KNOWN_HOSTS` secret (with warning fallback) |
+| Workflow Token Escalation | High | Explicit workflow `permissions: contents: read` (least privilege) |
+| Leaked secrets | Critical | GitHub secret masking, no secrets passed to PRs |
+| Unauthorized access | High | SSH key-only auth, firewall rules |
+| Supply chain attack | Medium | Pinned dependencies, lockfile, pinned action versions |
+| Runner compromise | High | Isolated LXC, minimal permissions, CD-only push triggers |
 
 ## Security Controls
 
-### 1. Deployment Isolation
+### 1. Deployment Isolation & Runner Boundary
+
+The architecture enforces a strict physical and cryptographic boundary between untrusted CI execution and trusted production deployment:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Isolation Boundaries                       │
-│                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   GitHub      │    │   Runner     │    │   API LXC    │  │
-│  │              │    │              │    │              │  │
-│  │  Cloud       │    │  On-prem     │    │  On-prem     │  │
-│  │  Managed     │    │  Self-hosted │    │  Self-hosted │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                              │
-│  Each boundary requires authentication                      │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             Isolation Boundaries                                 │
+│                                                                                  │
+│   GITHUB CLOUD INFRASTRUCTURE                 PROXMOX ON-PREMISES LAN            │
+│  ┌───────────────────────────────┐           ┌─────────────────┐ ┌────────────┐ │
+│  │ Ephemeral Runner              │           │ Runner LXC      │ │ API LXC    │ │
+│  │ (ubuntu-latest)               │           │ (self-hosted)   │ │            │ │
+│  │                               │           │                 │ │ bun-api    │ │
+│  │ - CI Validation Only          │           │ - CD Deploy Only│ │ .env(shared│ │
+│  │ - PRs & pushes to main        │           │ - Push to main  │ │ port 3000  │ │
+│  │ - Isolated from LAN           │           │   gate ONLY     │ │ internal   │ │
+│  │ - Zero deploy secrets         │           │ - SSH to API    │ │            │ │
+│  │ - permissions: contents: read │           │                 │ │            │ │
+│  └───────────────────────────────┘           └────────┬────────┘ └─────▲──────┘ │
+│                                                       │     SSH (22)   │        │
+│                                                       └────────────────┘        │
+│  Public PRs NEVER execute on self-hosted runners or access the internal network. │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+#### Cloud vs Self-Hosted Runner Boundary
+
+- **Public Pull Request Protection**: In a public repository, code submitted in pull requests must be treated as untrusted. The `ci` job executes strictly on GitHub-hosted `ubuntu-latest` runners. Even if malicious code is embedded in tests, dependencies, or PR files, it executes inside an ephemeral GitHub cloud VM with **no connectivity to the internal Proxmox LAN**, no access to internal IP addresses, and no access to deployment secrets.
+- **Production Deployment Boundary**: The `deploy` job runs exclusively on the internal `self-hosted` Proxmox LXC runner and is strictly gated to push events on `refs/heads/main` (`if: github.event_name == 'push' && github.ref == 'refs/heads/main'`). Pull requests cannot trigger the deployment job under any circumstances.
 
 ### 2. SSH Security
 
@@ -57,6 +72,13 @@ chmod 600 ~/.ssh/id_ed25519
 chmod 644 ~/.ssh/id_ed25519.pub
 chmod 700 ~/.ssh
 ```
+
+#### Host Key Verification & MITM Protection (`API_SSH_KNOWN_HOSTS`)
+
+To prevent Man-in-the-Middle (MITM) attacks and DNS/IP spoofing during deployment:
+- **Pre-configured Secret**: Store the target server's public host key fingerprint in the `API_SSH_KNOWN_HOSTS` repository secret. The deploy workflow writes this directly to `~/.ssh/known_hosts`.
+- **Dynamic Fallback**: If the secret is not configured, the workflow falls back to querying the host key via `ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST"` and issues a GitHub Actions warning annotation (`::warning::API_SSH_KNOWN_HOSTS secret not configured; falling back to dynamic ssh-keyscan`).
+- **Strict Host Checking**: The runner's SSH config enforces `StrictHostKeyChecking yes` and `UserKnownHostsFile ~/.ssh/known_hosts`, ensuring connections are rejected if the host key changes unexpectedly.
 
 #### Key Rotation Schedule
 
@@ -88,20 +110,39 @@ API_KEY=sk-1234567890
 - run: echo "Deploying with key..."
 ```
 
-### 4. PR Safety
+### 4. PR Safety & Fork Isolation
 
 ```yaml
-# Deploy ONLY on push to main
+# CI runs on ephemeral cloud runner (untrusted code isolation)
+ci:
+  runs-on: ubuntu-latest
+
+# Deploy runs ONLY on self-hosted runner for push to main
 deploy:
+  needs: ci
   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  runs-on: self-hosted
 ```
 
-**Why**: PRs can come from:
-- External contributors (untrusted)
-- Fork repositories (untrusted)
-- Compromised branches
+**Why**: Pull requests can originate from external forks or untrusted branches. Protection measures include:
+- **Cloud Runner Isolation**: All validation (type checking, test execution, dependency resolution) runs on `ubuntu-latest` inside an ephemeral, disposable container in GitHub Cloud. Untrusted PR code has zero network access to the internal Proxmox environment.
+- **Automatic Secret Stripping**: GitHub Actions automatically suppresses repository secrets on PRs submitted from fork repositories.
+- **Deploy Gating**: The deploy job is hard-gated to push events on `refs/heads/main` and will never execute on PR triggers.
 
 ### 5. Principle of Least Privilege
+
+#### Workflow Token Permissions (`GITHUB_TOKEN`)
+
+The workflow explicitly declares top-level permissions constrained to `contents: read`:
+
+```yaml
+permissions:
+  contents: read
+```
+
+- **Read-Only Scope**: The automated `GITHUB_TOKEN` is strictly constrained to read repository contents.
+- **Elevation Prevention**: Write permissions on packages, actions, deployments, issues, and pull request metadata are disabled.
+- **Supply-Chain Compromise Blast-Radius**: Even if an external npm dependency or malicious script runs during CI, it cannot abuse the token to push malicious commits, create fraudulent releases, or alter repository settings.
 
 #### Runner User
 
@@ -176,9 +217,10 @@ chmod 755 /opt/finanzas-api/releases
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
-| SSH key compromise | Full server access | Low | Rotation, monitoring |
-| Malicious deploy | Service compromise | Low | PR-only CI, no deploy |
-| API key leak | Provider abuse | Medium | .env protection, no logging |
+| SSH key compromise | Full server access | Low | Rotation, monitoring, strictly constrained sudoers |
+| Malicious PR / Fork code | LAN intrusion / Compromise | Low | CI isolated to ephemeral `ubuntu-latest`; deploy restricted to push on main |
+| SSH MITM / Spoofing | Deployment interception | Low | Pre-configured `API_SSH_KNOWN_HOSTS` fingerprint; strict host checking |
+| API key leak | Provider abuse | Medium | .env protection, no logging, secrets masking |
 
 ### Medium Risk
 
