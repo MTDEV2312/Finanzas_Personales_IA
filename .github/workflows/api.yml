@@ -111,39 +111,44 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
-      - name: Backup Current Version
-        env:
-          DEPLOY_PATH: ${{ secrets.API_DEPLOY_PATH || '/opt/finanzas-api/api' }}
+      - name: Create Release Directory
         run: |
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          ssh api-server "
-            set -e
-            mkdir -p /opt/backups/finanzas-api
-            if [ -d '$DEPLOY_PATH' ]; then
-              cp -r '$DEPLOY_PATH' '/opt/backups/finanzas-api/finanzas-api-${TIMESTAMP}'
-              echo \"✅ Backup created: /opt/backups/finanzas-api/finanzas-api-${TIMESTAMP}\"
-            else
-              echo \"ℹ️ Target path $DEPLOY_PATH does not exist yet, skipping backup.\"
-            fi
-          "
+          RELEASE_DIR="/opt/finanzas-api/releases/$(date +%Y%m%d_%H%M%S)"
+          echo "RELEASE_DIR=$RELEASE_DIR" >> "$GITHUB_ENV"
+          ssh api-server "mkdir -p '$RELEASE_DIR'"
+          echo "✅ Created release directory: $RELEASE_DIR"
 
       - name: Deploy via SSH (Rsync)
-        env:
-          DEPLOY_PATH: ${{ secrets.API_DEPLOY_PATH || '/opt/finanzas-api/api' }}
         run: |
-          ssh api-server "mkdir -p '$DEPLOY_PATH'"
           rsync -avz --delete \
             --exclude='.env' \
             --exclude='.git*' \
             -e "ssh api-server" \
             ./api/ \
-            api-server:"$DEPLOY_PATH"/
+            api-server:"$RELEASE_DIR"/
+          echo "✅ Production build artifacts deployed to $RELEASE_DIR"
 
-      - name: Restart Service
+      - name: Assert and Link Shared Environment
         run: |
-          ssh api-server \
-            "sudo systemctl reload-or-restart bun-api.service && \
-             echo '✅ Service reloaded/restarted successfully'"
+          ssh api-server "
+            set -e
+            if [ ! -f /opt/finanzas-api/shared/.env ]; then
+              echo '❌ Error: /opt/finanzas-api/shared/.env does not exist!' >&2
+              exit 1
+            fi
+            ln -sfn /opt/finanzas-api/shared/.env '$RELEASE_DIR/.env'
+            echo '✅ Shared .env linked to release'
+          "
+
+      - name: Atomic Cutover & Service Reload
+        run: |
+          ssh api-server "
+            set -e
+            ln -sfn '$RELEASE_DIR' /opt/finanzas-api/current
+            echo '✅ Atomic pointer cutover completed: /opt/finanzas-api/current -> $RELEASE_DIR'
+            sudo systemctl reload-or-restart bun-api.service || sudo systemctl restart bun-api.service
+            echo '✅ Service reloaded/restarted successfully'
+          "
 
       - name: Health Check
         run: |
@@ -165,24 +170,37 @@ jobs:
           echo "❌ Health check failed after 3 attempts"
           exit 1
 
+      - name: Prune Old Releases
+        run: |
+          ssh api-server "
+            echo '🧹 Pruning old releases (retaining 5 most recent)...'
+            ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf
+            echo '✅ Release retention pruning completed'
+          "
+
       - name: Rollback on Failure
         if: failure()
-        env:
-          DEPLOY_PATH: ${{ secrets.API_DEPLOY_PATH || '/opt/finanzas-api/api' }}
         run: |
-          echo "🔄 Rolling back to previous version..."
+          echo "🔄 Rolling back to previous release..."
 
           ssh api-server "
-            LATEST_BACKUP=\$(ls -td /opt/backups/finanzas-api/finanzas-api-* 2>/dev/null | head -1)
-
-            if [ -n \"\$LATEST_BACKUP\" ] && [ -d \"\$LATEST_BACKUP\" ]; then
-              echo \"Found backup: \$LATEST_BACKUP\"
-              rsync -avz --delete --exclude='.env' \"\$LATEST_BACKUP/\" \"$DEPLOY_PATH/\"
-              sudo systemctl reload-or-restart bun-api.service || sudo systemctl restart bun-api.service
-              echo '✅ Rollback completed successfully'
-              exit 1
-            else
-              echo '❌ No backup found for rollback! Manual operator intervention required.'
-              exit 1
+            PREV_RELEASE=\$(ls -dt /opt/finanzas-api/releases/* 2>/dev/null | sed -n '2p')
+            if [ -z \"\$PREV_RELEASE\" ]; then
+              PREV_RELEASE=\$(ls -dt /opt/finanzas-api/releases/* 2>/dev/null | grep -v -x \"$RELEASE_DIR\" | head -n 1)
             fi
+
+            if [ -n \"\$PREV_RELEASE\" ] && [ -d \"\$PREV_RELEASE\" ]; then
+              echo \"Found previous release: \$PREV_RELEASE\"
+              ln -sfn \"\$PREV_RELEASE\" /opt/finanzas-api/current
+              sudo systemctl reload-or-restart bun-api.service || sudo systemctl restart bun-api.service
+              echo '✅ Rollback completed: /opt/finanzas-api/current repointed to \$PREV_RELEASE'
+            else
+              echo '❌ No previous release found for rollback!'
+            fi
+
+            if [ -n \"$RELEASE_DIR\" ] && [ -d \"$RELEASE_DIR\" ]; then
+              echo \"Removing failed release directory: $RELEASE_DIR\"
+              rm -rf \"$RELEASE_DIR\"
+            fi
+            exit 1
           "
