@@ -44,148 +44,171 @@ fi
 */5 * * * * /opt/scripts/check-api.sh
 ```
 
-## Backup Operations
+## Release Management & Retention Operations
 
-### Manual Backup
+### Immutable Release Snapshots
+
+With atomic symlink deployment, every release is an isolated, immutable directory under `/opt/finanzas-api/releases/<timestamp>/`. Separate backup copying is no longer needed.
+
+### Automated Retention Pruning
+
+The CI/CD pipeline automatically retains the 5 most recent releases after a successful deployment. To run pruning manually:
 
 ```bash
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-cp -r /opt/finanzas-api/api /opt/backups/finanzas-api-${TIMESTAMP}
-echo "Backup created: finanzas-api-${TIMESTAMP}"
+# Keep 5 newest releases and remove older directories
+ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf
 ```
 
-### Automated Backup Script
-
-**File**: `/opt/scripts/backup-api.sh`
+### Release Inspection & Audit
 
 ```bash
-#!/bin/bash
-BACKUP_DIR="/opt/backups"
-SOURCE="/opt/finanzas-api/api"
-KEEP=5
+# View active symlink pointer
+ls -l /opt/finanzas-api/current
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_NAME="finanzas-api-${TIMESTAMP}"
+# List all release directories ordered by modification time
+ls -lt /opt/finanzas-api/releases/
 
-cp -r $SOURCE ${BACKUP_DIR}/${BACKUP_NAME}
-echo "Created backup: ${BACKUP_NAME}"
-
-# Cleanup old backups
-ls -dt ${BACKUP_DIR}/finanzas-api-* | tail -n +$((KEEP+1)) | xargs rm -rf
-echo "Cleaned up old backups, keeping ${KEEP}"
-```
-
-### Backup Cron Job
-
-```bash
-# Daily backup at 2 AM
-0 2 * * * /opt/scripts/backup-api.sh >> /var/log/api-backup.log 2>&1
-```
-
-### Verify Backup
-
-```bash
-# List backups
-ls -la /opt/backups/finanzas-api-*
-
-# Check backup size
-du -sh /opt/backups/finanzas-api-*
-
-# Verify backup content
-ls -la /opt/backups/finanzas-api-$(date +%Y%m%d)/
+# Inspect disk footprint of releases
+du -sh /opt/finanzas-api/releases/*
 ```
 
 ## Deploy Operations
 
 ### Standard Deploy (Automated)
 
-Triggered by GitHub Actions on push to `main` with `api/**` changes.
+Triggered by GitHub Actions on push to `main` with changes in `api/**` or `.github/workflows/api.yml`:
+1. Self-hosted runner builds production artifacts (`bun install --production`).
+2. Creates isolated release directory `/opt/finanzas-api/releases/<timestamp>/`.
+3. Rsyncs build artifacts to the new release directory.
+4. Symlinks `/opt/finanzas-api/shared/.env` to `${RELEASE_DIR}/.env`.
+5. Executes atomic pointer cutover: `ln -sfn "${RELEASE_DIR}" /opt/finanzas-api/current`.
+6. Reloads/restarts `bun-api.service`.
+7. Verifies health endpoint (`GET http://localhost:3000/health`).
+8. On success: Prunes older releases keeping the 5 most recent.
+9. On failure: Triggers instant pointer rollback.
 
 ### Manual Deploy
 
 ```bash
-# On API LXC
+# On API LXC:
 
-# 1. Backup current version
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-cp -r /opt/finanzas-api/api /opt/backups/finanzas-api-${TIMESTAMP}
+# 1. Create timestamped release directory
+RELEASE_DIR="/opt/finanzas-api/releases/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RELEASE_DIR"
 
-# 2. Copy new files (from local machine or git)
-cd /opt/finanzas-api
-git pull origin main
-
-# 3. Install dependencies
-cd api
+# 2. Copy artifacts to release directory
+cp -r /path/to/source/api/* "$RELEASE_DIR/"
+cd "$RELEASE_DIR"
 bun install --production
 
-# 4. Restart service
-systemctl restart bun-api.service
+# 3. Symlink shared environment configuration
+ln -sfn /opt/finanzas-api/shared/.env "$RELEASE_DIR/.env"
 
-# 5. Verify health
-sleep 5
+# 4. Atomic pointer cutover
+ln -sfn "$RELEASE_DIR" /opt/finanzas-api/current
+
+# 5. Reload/restart service
+systemctl reload-or-restart bun-api.service || systemctl restart bun-api.service
+
+# 6. Verify health
+sleep 3
 curl http://localhost:3000/health
+
+# 7. Prune older releases (retain 5 newest)
+ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf
 ```
 
-### Emergency Deploy
+### Emergency Recovery Deploy
 
 ```bash
-# If automated deploy fails
-
-# 1. Stop service
-systemctl stop bun-api.service
-
-# 2. Restore from backup
-LATEST_BACKUP=$(ls -t /opt/backups/finanzas-api-* | head -1)
-rm -rf /opt/finanzas-api/api/*
-cp -r ${LATEST_BACKUP}/* /opt/finanzas-api/api/
-
-# 3. Start service
-systemctl start bun-api.service
-
-# 4. Verify
+# If active deployment is corrupted and requires immediate reset:
+# Repoint current to the last known good release
+PREV_RELEASE=$(ls -dt /opt/finanzas-api/releases/* | sed -n '2p')
+ln -sfn "$PREV_RELEASE" /opt/finanzas-api/current
+systemctl reload-or-restart bun-api.service || systemctl restart bun-api.service
 curl http://localhost:3000/health
 ```
 
 ## Rollback Operations
 
-### Automatic Rollback
+### Automated Rollback
 
-Triggered by GitHub Actions when health check fails after deploy.
+GitHub Actions automatically executes instant pointer rollback if health verification fails after deployment:
+1. Identifies the previous release: `ls -dt /opt/finanzas-api/releases/* | sed -n '2p'`.
+2. Repoints `/opt/finanzas-api/current` to previous release via `ln -sfn`.
+3. Restarts `bun-api.service`.
+4. Deletes the failed release directory.
+5. Fails workflow with exit status 1.
 
-### Manual Rollback
+### Instant Pointer Rollback (Manual)
+
+To instantaneously revert the active release to the previous release (sub-millisecond pointer switch):
 
 ```bash
-# 1. List available backups
-ls -lt /opt/backups/finanzas-api-*
+# 1. Identify previous release directory
+PREV_RELEASE=$(ls -dt /opt/finanzas-api/releases/* | sed -n '2p')
+echo "Reverting to: $PREV_RELEASE"
 
-# 2. Identify target backup
-BACKUP="/opt/backups/finanzas-api-YYYYMMDD_HHMMSS"
+# 2. Atomically swap pointer
+ln -sfn "$PREV_RELEASE" /opt/finanzas-api/current
 
-# 3. Stop service
-systemctl stop bun-api.service
+# 3. Reload/restart service
+systemctl reload-or-restart bun-api.service || systemctl restart bun-api.service
 
-# 4. Restore files
-rm -rf /opt/finanzas-api/api/*
-cp -r ${BACKUP}/* /opt/finanzas-api/api/
-
-# 5. Start service
-systemctl start bun-api.service
-
-# 6. Verify
+# 4. Verify health
 curl http://localhost:3000/health
 ```
 
-### Rollback to Specific Version
+### Rollback to Specific Release
 
 ```bash
-# If multiple backups exist, choose specific one
-BACKUP=$(ls -dt /opt/backups/finanzas-api-* | grep "YYYYMMDD" | head -1)
+# 1. List available releases
+ls -lt /opt/finanzas-api/releases/
 
-# Restore
-systemctl stop bun-api.service
-rm -rf /opt/finanzas-api/api/*
-cp -r ${BACKUP}/* /opt/finanzas-api/api/
-systemctl start bun-api.service
+# 2. Point current to selected release timestamp
+ln -sfn /opt/finanzas-api/releases/YYYYMMDD_HHMMSS /opt/finanzas-api/current
+
+# 3. Reload/restart service
+systemctl reload-or-restart bun-api.service || systemctl restart bun-api.service
+
+# 4. Verify health
+curl http://localhost:3000/health
+```
+
+## Server Migration Runbook (4-Step Zero-Downtime Migration)
+
+This runbook migrates an existing in-place server deployment (`/opt/finanzas-api/api`) to the atomic symlink release architecture without downtime.
+
+### Step 1: Hierarchy Setup
+Create the directory structure for immutable releases and shared configuration:
+```bash
+mkdir -p /opt/finanzas-api/releases /opt/finanzas-api/shared
+```
+
+### Step 2: Config Migration
+Relocate `.env` to the shared directory and set strict permissions:
+```bash
+mv /opt/finanzas-api/api/.env /opt/finanzas-api/shared/.env && chmod 600 /opt/finanzas-api/shared/.env
+```
+
+### Step 3: Initial Baseline & Symlink
+Establish the existing API directory as the initial release baseline and create symlinks for `current` and `.env`:
+```bash
+mv /opt/finanzas-api/api /opt/finanzas-api/releases/initial && ln -sfn /opt/finanzas-api/releases/initial /opt/finanzas-api/current && ln -sfn /opt/finanzas-api/shared/.env /opt/finanzas-api/current/.env
+```
+
+### Step 4: Systemd Cutover
+Update the service unit to use `/opt/finanzas-api/current` as `WorkingDirectory`, reload systemd, and restart the service:
+```bash
+sed -i 's|WorkingDirectory=.*|WorkingDirectory=/opt/finanzas-api/current|' /etc/systemd/system/bun-api.service && systemctl daemon-reload && systemctl restart bun-api.service
+```
+
+### Post-Migration Verification
+Confirm service operational status:
+```bash
+systemctl status bun-api.service
+curl http://localhost:3000/health
+ls -l /opt/finanzas-api/current
 ```
 
 ## Service Management
@@ -313,10 +336,9 @@ systemctl restart bun-api.service
 ```bash
 # Check disk usage
 df -h /opt/finanzas-api
-df -h /opt/backups
 
-# Remove old backups manually
-rm -rf /opt/backups/finanzas-api-*
+# Prune excess releases manually (retain 5 newest)
+ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf
 
 # Clean journal logs
 journalctl --vacuum-size=100M
@@ -344,7 +366,7 @@ systemctl restart nginx  # if using reverse proxy
 | `journalctl -u bun-api -f` | Live logs |
 | `ss -tlnp \| grep 3000` | Port listening |
 | `ps aux \| grep bun` | Process check |
-| `df -h` | Disk usage |
+| `df -h /opt/finanzas-api` | Disk usage |
 | `free -h` | Memory usage |
 | `uptime` | System uptime |
 
@@ -358,8 +380,7 @@ crontab -e
 
 # Add tasks
 */5 * * * * /opt/scripts/check-api.sh  # Health check every 5 min
-0 2 * * * /opt/scripts/backup-api.sh   # Daily backup at 2 AM
-0 0 * * * /opt/scripts/cleanup-backups.sh  # Cleanup weekly
+0 3 * * 0 ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf  # Weekly retention pruning check
 ```
 
 ### Verify Crontab

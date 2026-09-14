@@ -13,13 +13,14 @@ Before starting, verify:
 
 ## Phase 1: Server Preparation
 
-### 1.1 Create Backup Directory
+### 1.1 Create Release and Shared Directories
 
 On the **API LXC**, execute:
 
 ```bash
-mkdir -p /opt/backups/finanzas-api
-chmod 755 /opt/backups/finanzas-api
+mkdir -p /opt/finanzas-api/releases /opt/finanzas-api/shared
+chmod 755 /opt/finanzas-api/releases
+chmod 700 /opt/finanzas-api/shared
 ```
 
 ### 1.2 Verify Bun Installation
@@ -218,11 +219,9 @@ On **API LXC**:
 # Check service status
 systemctl status bun-api.service
 
-# Check deployed files
-ls -la /opt/finanzas-api/api/
-
-# Check backup was created
-ls -la /opt/backups/
+# Check active release and symlink pointer
+ls -l /opt/finanzas-api/current
+ls -la /opt/finanzas-api/releases/
 
 # Test health endpoint
 curl http://localhost:3000/health

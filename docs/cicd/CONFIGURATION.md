@@ -9,7 +9,7 @@ This document contains all configuration files and settings required for the CI/
 | `API_SSH_HOST` | IP address of API LXC | `your_server_ip_here` | Yes |
 | `API_SSH_USER` | SSH username | `root` | Yes |
 | `API_SSH_KEY` | SSH private key (ed25519) | `-----BEGIN OPENSSH...` | Yes |
-| `API_DEPLOY_PATH` | Deploy path on API server | `/opt/finanzas-api/api` | Yes |
+| `API_DEPLOY_PATH` | Base deploy path on API server (defaults to `/opt/finanzas-api`) | `/opt/finanzas-api` | Optional |
 
 ### How to Add Secrets
 
@@ -30,7 +30,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/finanzas-api/api
+WorkingDirectory=/opt/finanzas-api/current
 ExecStart=/usr/local/bin/bun run index.ts
 Restart=on-failure
 RestartSec=10
@@ -43,7 +43,7 @@ Environment=NODE_ENV=production
 Environment=IDLE_TIMEOUT_SECONDS=120
 
 # Load API keys from file
-EnvironmentFile=/opt/finanzas-api/api/.env
+EnvironmentFile=/opt/finanzas-api/current/.env
 
 # Logging
 StandardOutput=journal
@@ -69,6 +69,7 @@ systemctl status bun-api.service
 systemctl start bun-api.service
 systemctl stop bun-api.service
 systemctl restart bun-api.service
+systemctl reload-or-restart bun-api.service
 
 # Enable on boot
 systemctl enable bun-api.service
@@ -84,18 +85,14 @@ journalctl -u bun-api.service --since "1 hour ago"
 
 ```
 # Sudoers configuration for GitHub Actions runner
-# Created: $(date)
 # Purpose: Allow CI/CD to manage bun-api service
 
 # Service management
+root ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload-or-restart bun-api
 root ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart bun-api
 root ALL=(ALL) NOPASSWD: /usr/bin/systemctl status bun-api
 root ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop bun-api
 root ALL=(ALL) NOPASSWD: /usr/bin/systemctl start bun-api
-
-# Backup management
-root ALL=(ALL) NOPASSWD: /bin/cp -r /opt/finanzas-api/api /opt/backups/finanzas-api-*
-root ALL=(ALL) NOPASSWD: /bin/rm -rf /opt/backups/finanzas-api-*
 
 # File operations (for rsync)
 root ALL=(ALL) NOPASSWD: /usr/bin/rsync
@@ -145,7 +142,9 @@ chmod 600 /root/.ssh/authorized_keys
 
 ### Environment Variables
 
-**File**: `/opt/finanzas-api/api/.env`
+**Canonical File**: `/opt/finanzas-api/shared/.env`  
+**Symlinked File**: `/opt/finanzas-api/current/.env`  
+**Permissions**: `chmod 600 /opt/finanzas-api/shared/.env`
 
 ```bash
 # Server Configuration
@@ -203,29 +202,36 @@ ufw enable
 
 > **Note**: If API needs external access, adjust firewall accordingly.
 
-## Backup Configuration
+## Release Directory & Retention Configuration
 
-### Backup Directory
+### Release Directory Hierarchy
 
 ```
-/opt/backups/finanzas-api/
-├── finanzas-api-20260913_143022/
-├── finanzas-api-20260913_150045/
-└── finanzas-api-20260913_160112/
+/opt/finanzas-api/
+├── current -> releases/YYYYMMDD_HHMMSS/ # Active release symlink pointer
+├── shared/
+│   └── .env                             # Canonical persistent environment file (0600)
+└── releases/
+    ├── 20260914_143022/
+    ├── 20260914_150045/
+    └── 20260914_160112/
 ```
 
-### Backup Retention
+### Release Retention Policy
 
 ```bash
-# Keep last 5 backups
-ls -dt /opt/backups/finanzas-api-* | tail -n +6 | xargs rm -rf
+# Retain the 5 most recent releases and remove older directories
+ls -dt /opt/finanzas-api/releases/* | tail -n +6 | xargs -r rm -rf
 ```
 
-### Manual Backup
+### Manual Pointer Inspection
 
 ```bash
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-cp -r /opt/finanzas-api/api /opt/backups/finanzas-api-${TIMESTAMP}
+# View active release pointer target
+ls -l /opt/finanzas-api/current
+
+# List all release snapshots ordered by time
+ls -lt /opt/finanzas-api/releases/
 ```
 
 ## Workflow Configuration
@@ -344,7 +350,6 @@ ps aux | grep bun
 
 # Disk usage
 df -h /opt/finanzas-api
-df -h /opt/backups
 
 # Memory usage
 free -h

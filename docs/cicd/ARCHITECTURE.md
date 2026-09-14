@@ -36,7 +36,7 @@ The CI/CD system connects two isolated LXC containers via SSH, using GitHub Acti
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │  bun-api.service (systemd, root)                                  │  │
 │  │                                                                   │  │
-│  │  Path: /opt/finanzas-api/api                                      │  │
+│  │  Working Directory: /opt/finanzas-api/current                     │  │
 │  │  Port: 3000                                                       │  │
 │  │  Runtime: Bun v1.3.5                                              │  │
 │  │                                                                   │  │
@@ -46,8 +46,9 @@ The CI/CD system connects two isolated LXC containers via SSH, using GitHub Acti
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                              │                                          │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  Backups: /opt/backups/finanzas-api/                              │  │
-│  │  Format: finanzas-api-YYYYMMDD_HHMMSS                            │  │
+│  │  Pointer:  /opt/finanzas-api/current -> releases/<timestamp>      │  │
+│  │  Releases: /opt/finanzas-api/releases/<timestamp>/ (max 5 kept)  │  │
+│  │  Shared:   /opt/finanzas-api/shared/.env (persistent config)      │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -70,9 +71,10 @@ The CI/CD system connects two isolated LXC containers via SSH, using GitHub Acti
 
 ### LXC API Server
 
-- **Service hosting**: Run the Bun API
-- **File storage**: Maintain application files
-- **Backup storage**: Keep previous versions
+- **Service hosting**: Run the Bun API via `/opt/finanzas-api/current`
+- **Release management**: Maintain immutable releases under `/opt/finanzas-api/releases/`
+- **Persistent config**: Maintain shared secrets at `/opt/finanzas-api/shared/.env`
+- **Pointer cutover**: Atomic symlink switching via `ln -sfn`
 - **Network exposure**: Serve API on port 3000
 
 ## Data Flow
@@ -85,15 +87,54 @@ Developer → git push → GitHub → Actions → Runner → SSH → LXC API
                                               ┌─────────────┼─────────────┐
                                               │             │             │
                                               ▼             ▼             ▼
-                                           Backup       Deploy       Restart
+                                            Rsync        Symlink       Cutover
+                                         (releases/)  (shared/.env)   (current)
                                                             │
                                                             ▼
-                                                      Health Check
+                                                    Reload / Restart
                                                             │
-                                                 ┌──────────┴──────────┐
-                                                 │                     │
-                                                 ▼                     ▼
-                                              Success              Rollback
+                                                            ▼
+                                                       Health Check
+                                                            │
+                                                  ┌──────────┴──────────┐
+                                                  │                     │
+                                                  ▼                     ▼
+                                               Success               Rollback
+                                            (Prune >5)         (Pointer Revert
+                                                               & Purge Failed)
+```
+
+### Deployment Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Dev as Developer
+    participant GH as GitHub Actions (CI)
+    participant Runner as Self-Hosted Runner
+    participant API as Proxmox LXC (API Server)
+    participant Systemd as bun-api.service
+
+    Dev->>GH: Push to main (api/**)
+    GH->>Runner: Execute CI (typecheck & test)
+    Runner-->>GH: CI Passed
+    GH->>Runner: Start Deploy Job
+    Runner->>API: SSH: mkdir /opt/finanzas-api/releases/<timestamp>
+    Runner->>API: Rsync build artifacts to releases/<timestamp>/
+    Runner->>API: Assert /opt/finanzas-api/shared/.env exists
+    Runner->>API: Symlink shared/.env -> releases/<timestamp>/.env
+    Runner->>API: Atomic Cutover: ln -sfn releases/<timestamp> /opt/finanzas-api/current
+    Runner->>Systemd: reload-or-restart bun-api.service
+    Runner->>API: Health Check: GET http://localhost:3000/health (3 retries)
+    alt Health Check Succeeded
+        Runner->>API: Prune old releases (retain 5 newest via xargs -r rm -rf)
+        Runner-->>GH: Deployment Successful
+    else Health Check Failed
+        Runner->>API: Repoint /opt/finanzas-api/current to previous release (ln -sfn)
+        Runner->>Systemd: Restart bun-api.service
+        Runner->>API: Purge failed release directory
+        Runner-->>GH: Deployment Failed (Exit 1)
+    end
 ```
 
 ### Pull Request (CI Only)
@@ -130,18 +171,19 @@ Developer → git push → GitHub → Actions → Runner
 
 ```
 /opt/finanzas-api/
-├── api/                    # Current deployment
-│   ├── index.ts
-│   ├── package.json
-│   ├── bun.lock
-│   ├── services/
-│   └── ...
-│
-/opt/backups/
-└── finanzas-api-*/         # Timestamped backups
-    ├── index.ts
-    ├── package.json
-    └── ...
+├── current -> releases/YYYYMMDD_HHMMSS/ # Active release symlink pointer
+├── shared/
+│   └── .env                             # Canonical environment configuration (chmod 0600)
+└── releases/                            # Immutable release snapshots (retains 5 newest)
+    ├── 20260914_140000/
+    │   ├── .env -> /opt/finanzas-api/shared/.env
+    │   ├── index.ts
+    │   ├── package.json
+    │   ├── bun.lock
+    │   ├── services/
+    │   └── ...
+    └── 20260914_150000/
+        └── ...
 ```
 
 ### LXC Runner
@@ -166,8 +208,9 @@ bun-api.service
       │
       ├── Depends on: network.target
       ├── User: root
-      ├── WorkingDirectory: /opt/finanzas-api/api
-      └── ExecStart: /usr/local/bin/bun run index.ts
+      ├── WorkingDirectory: /opt/finanzas-api/current
+      ├── ExecStart: /usr/local/bin/bun run index.ts
+      └── EnvironmentFile: /opt/finanzas-api/current/.env
 ```
 
 ### External Dependencies
@@ -187,11 +230,11 @@ bun-api.service
 |---------|-----------|----------|
 | Type check fails | CI job fails | Block merge, no deploy |
 | SSH connection fails | Deploy job fails | No changes applied |
-| Backup fails | Deploy job fails | Abort, no changes |
-| Deploy fails | Deploy job fails | Rollback |
-| Health check fails | Deploy job fails | Rollback |
-| Service won't start | Health check fails | Rollback |
-| Rollback fails | Manual intervention | Alert, manual recovery |
+| Missing shared configuration (`shared/.env`) | Deploy step assertion fails | Abort deployment before restart, error logged |
+| Rsync deploy fails | Deploy job fails | Abort deployment, pointer unchanged |
+| Service reload/restart fails | Systemd error | Trigger automated rollback |
+| Health check fails | Deploy job fails (3 retries) | Instant pointer rollback (`ln -sfn` to previous release), restart service, purge failed release dir |
+| Rollback fails | Manual intervention | Alert operator, manual symlink inspection & restoration |
 
 ## Security Boundaries
 

@@ -154,11 +154,11 @@ chown -R root:root /opt/finanzas-api
 chmod -R 755 /opt/finanzas-api
 
 # Environment file (contains secrets)
-chmod 600 /opt/finanzas-api/api/.env
-chown root:root /opt/finanzas-api/api/.env
+chmod 600 /opt/finanzas-api/shared/.env
+chown root:root /opt/finanzas-api/shared/.env
 
-# Backup directory
-chmod 755 /opt/backups/finanzas-api
+# Releases directory
+chmod 755 /opt/finanzas-api/releases
 ```
 
 #### Sensitive Files
