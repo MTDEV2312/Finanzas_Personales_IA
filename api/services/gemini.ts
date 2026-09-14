@@ -14,10 +14,12 @@ export const geminiService: AIService = {
         }));
 
         const stream = await gemini.models.generateContentStream({
-            model: 'gemini-3-flash-preview',
+            model: 'gemini-3.6-flash',
             contents,
             config: {
-                thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+                temperature: 0.1,
+                responseMimeType: "application/json",
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             },
         });
 

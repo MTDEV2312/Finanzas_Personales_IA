@@ -1,9 +1,5 @@
-import { cerebrasService } from "./services/cerebras";
-import { geminiService } from "./services/gemini";
 import { groqService } from "./services/groq";
-import {miniMaxService, qwenService } from "./services/huggingface";
-import { mistralService } from "./services/mistral";
-import { openRouterService } from "./services/openRouter";
+import { geminiService } from "./services/gemini";
 import { AIServiceError, type AIService, type ChatMessage } from "./types";
 
 const SYSTEM_PROMPT = `Eres un asistente contable experto especializado en extracción estructurada de gastos a partir de texto en lenguaje natural.
@@ -36,26 +32,24 @@ Ejemplo de salida:
   "categoria": "Alimentación"
 }`;
 
+// Groq como proveedor ultra-rápido principal (~600ms) y Gemini 3.6 Flash como fallback
 const services: AIService[] = [
     groqService,
-    cerebrasService,
-    geminiService,
-    mistralService,
-    openRouterService,
-    miniMaxService,
-    qwenService
-]
+    geminiService
+];
 let currentServiceIndex = 0;
 
-function getNextService(){
-    const service= services[currentServiceIndex];
+function getNextService() {
+    const service = services[currentServiceIndex];
     currentServiceIndex = (currentServiceIndex + 1) % services.length;
     return service;
 }
+
+const timeoutPromise = (ms: number) => new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms));
+
 async function getStreamWithFallback(messages: ChatMessage[]) {
     let lastError: unknown;
 
-    // Agregar el prompt del sistema al inicio de los mensajes si no está presente
     const messagesWithSystem: ChatMessage[] = 
         messages[0]?.role === 'system' 
             ? messages 
@@ -65,7 +59,10 @@ async function getStreamWithFallback(messages: ChatMessage[]) {
         const service = getNextService();
         try {
             console.log(`Using service: ${service?.name}`);
-            const stream = await service?.chat(messagesWithSystem);
+            const streamPromise = service?.chat(messagesWithSystem);
+            if (!streamPromise) continue;
+            
+            const stream = await Promise.race([streamPromise, timeoutPromise(3000)]);
             if (stream) {
                 return { service, stream };
             }
@@ -83,7 +80,7 @@ const server = Bun.serve({
     port: process.env.PORT ?? 3000,
     idleTimeout: Number(process.env.IDLE_TIMEOUT_SECONDS ?? 120),
     async fetch(req) {
-        const {pathname} = new URL(req.url);
+        const { pathname } = new URL(req.url);
         if (req.method === 'GET' && pathname === '/health') {
             return new Response(JSON.stringify({ status: 'ok' }), {
                 status: 200,
@@ -92,14 +89,13 @@ const server = Bun.serve({
         }
         if (req.method === 'POST' && pathname === '/chat') {
             try {
-                const {messages} = await req.json() as {messages: ChatMessage[]};
+                const { messages } = await req.json() as { messages: ChatMessage[] };
                 if (!Array.isArray(messages) || messages.length === 0) {
                     return new Response(JSON.stringify({ error: 'messages payload is required' }), { status: 400 });
                 }
 
                 const { service, stream } = await getStreamWithFallback(messages);
 
-                
                 const readableStream = new ReadableStream({
                     async start(controller) {
                         try {
@@ -113,8 +109,8 @@ const server = Bun.serve({
                     }
                 });
 
-                return new Response(readableStream,{
-                    headers:{
+                return new Response(readableStream, {
+                    headers: {
                         'Content-Type': 'text/event-stream',
                         'Cache-Control': 'no-cache',
                         'Connection': 'keep-alive',
@@ -131,7 +127,7 @@ const server = Bun.serve({
             }
         }
 
-        return new Response("Not Found", {status: 404});
+        return new Response("Not Found", { status: 404 });
     }
 });
 
