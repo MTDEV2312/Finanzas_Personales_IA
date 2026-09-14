@@ -1,0 +1,212 @@
+# =============================================================================
+# GitHub Actions Workflow — API CI/CD
+# =============================================================================
+# This is a REFERENCE file. Copy to .github/workflows/api.yml to activate.
+#
+# Repository: Finanzas_Personales_IA
+# Trigger: Push/PR to main with api/** changes
+# Runner: Self-hosted (LXC Runner)
+# Deploy: SSH to LXC API Server
+# =============================================================================
+
+name: API CI/CD
+
+# =============================================================================
+# TRIGGERS
+# =============================================================================
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/api.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/api.yml'
+
+# =============================================================================
+# CONCURRENCY
+# Prevent multiple deploys running simultaneously
+# =============================================================================
+concurrency:
+  group: api-deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # CI JOB — Type Checking
+  # Runs on: push and pull_request
+  # Purpose: Validate code quality
+  # ===========================================================================
+  ci:
+    name: CI — Type Checking
+    runs-on: self-hosted
+    
+    steps:
+      # -------------------------------------------------------------------------
+      # Checkout repository
+      # -------------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      # Setup Bun runtime
+      # -------------------------------------------------------------------------
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # -------------------------------------------------------------------------
+      # Install dependencies
+      # Uses frozen-lockfile for reproducibility
+      # -------------------------------------------------------------------------
+      - name: Install Dependencies
+        working-directory: api
+        run: bun install --frozen-lockfile
+
+      # -------------------------------------------------------------------------
+      # Type checking
+      # Fails if TypeScript errors exist
+      # -------------------------------------------------------------------------
+      - name: Type Checking
+        working-directory: api
+        run: bunx tsc --noEmit
+
+  # ===========================================================================
+  # DEPLOY JOB — Production Deploy
+  # Runs on: push to main only (after CI passes)
+  # Purpose: Deploy to production server
+  # ===========================================================================
+  deploy:
+    name: Deploy to Production
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    
+    steps:
+      # -------------------------------------------------------------------------
+      # Checkout repository
+      # -------------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      # Setup Bun runtime
+      # -------------------------------------------------------------------------
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # -------------------------------------------------------------------------
+      # Install production dependencies
+      # -------------------------------------------------------------------------
+      - name: Install Dependencies
+        working-directory: api
+        run: bun install --frozen-lockfile --production
+
+      # -------------------------------------------------------------------------
+      # Configure SSH
+      # Creates SSH config for connecting to API server
+      # -------------------------------------------------------------------------
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.API_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.API_SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # Create SSH config
+          cat >> ~/.ssh/config << EOF
+          Host api-server
+            HostName ${{ secrets.API_SSH_HOST }}
+            User ${{ secrets.API_SSH_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+          EOF
+
+      # -------------------------------------------------------------------------
+      # Backup current version
+      # Creates timestamped backup before deploy
+      # -------------------------------------------------------------------------
+      - name: Backup Current Version
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          ssh api-server \
+            "cp -r ${{ secrets.API_DEPLOY_PATH }} /opt/backups/finanzas-api-${TIMESTAMP} && \
+             echo 'Backup created: finanzas-api-${TIMESTAMP}'"
+
+      # -------------------------------------------------------------------------
+      # Deploy via rsync
+      # Syncs files to API server
+      # -------------------------------------------------------------------------
+      - name: Deploy via SSH
+        run: |
+          rsync -avz --delete \
+            -e "ssh api-server" \
+            ./api/ \
+            api-server:${{ secrets.API_DEPLOY_PATH }}/
+
+      # -------------------------------------------------------------------------
+      # Restart service
+      # Restarts the bun-api systemd service
+      # -------------------------------------------------------------------------
+      - name: Restart Service
+        run: |
+          ssh api-server \
+            "sudo systemctl restart bun-api && \
+             echo 'Service restarted'"
+
+      # -------------------------------------------------------------------------
+      # Health check
+      # Verifies the API is responding
+      # -------------------------------------------------------------------------
+      - name: Health Check
+        run: |
+          sleep 5
+          
+          for i in {1..3}; do
+            HTTP_STATUS=$(ssh api-server \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/health")
+            
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Health check passed (attempt $i)"
+              exit 0
+            fi
+            
+            echo "⚠️ Health check failed (attempt $i), retrying in 2s..."
+            sleep 2
+          done
+          
+          echo "❌ Health check failed after 3 attempts"
+          exit 1
+
+      # -------------------------------------------------------------------------
+      # Rollback on failure
+      # Restores previous version if health check fails
+      # -------------------------------------------------------------------------
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "🔄 Rolling back to previous version..."
+          
+          ssh api-server "
+            LATEST_BACKUP=\$(ls -t /opt/backups/finanzas-api-* | head -1)
+            
+            if [ -n \"\$LATEST_BACKUP\" ]; then
+              rm -rf ${{ secrets.API_DEPLOY_PATH }}/*
+              cp -r \$LATEST_BACKUP/* ${{ secrets.API_DEPLOY_PATH }}/
+              sudo systemctl restart bun-api
+              echo '✅ Rollback completed'
+            else
+              echo '❌ No backup found for rollback'
+              exit 1
+            fi
+          "
