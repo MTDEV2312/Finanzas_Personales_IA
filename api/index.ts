@@ -76,7 +76,7 @@ async function getStreamWithFallback(messages: ChatMessage[]) {
     throw lastError ?? new AIServiceError('unknown', 'All services failed');
 }
 
-const server = Bun.serve({
+export const server = Bun.serve({
     port: process.env.PORT ?? 3000,
     idleTimeout: Number(process.env.IDLE_TIMEOUT_SECONDS ?? 120),
     async fetch(req) {
